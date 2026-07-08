@@ -127,6 +127,60 @@ def test_fit_raises_if_train_split_has_one_class():
 
 
 # ------------------------------------------------------------------
+# Fix regression tests
+# ------------------------------------------------------------------
+
+def test_decisiveness_symmetry():
+    """Fix 1: score near 0 and near 1 should both produce high node strength.
+    Before the fix, score=0.02 (error-leaning) produced near-zero strength
+    because raw score was used as topology weight instead of decisiveness."""
+    from synolitic.stage2_graphs.build_graphs import SynoliticEnsemble, _build_sample_graph
+    import itertools
+
+    d = 4
+    pairs = list(itertools.combinations(range(d), 2))  # 6 pairs
+    W = np.zeros((len(pairs), 2), dtype=np.float32)
+    b = np.zeros(len(pairs), dtype=np.float32)
+    x_vec = np.zeros(d, dtype=np.float32)
+
+    for score_val, label in [(0.98, "correct-leaning"), (0.02, "error-leaning")]:
+        scores_row = np.full(len(pairs), 0.5, dtype=np.float32)
+        scores_row[0] = score_val  # pair (0,1) is very decisive
+        feats, _, _ = _build_sample_graph(x_vec, pairs, scores_row, d, top_k=1)
+        # nodes 0 and 1 must have strength > 0.9 (decisiveness ~ 0.96)
+        assert feats[0, 2] > 0.9, f"{label}: node 0 strength={feats[0,2]:.3f}, expected >0.9"
+        assert feats[1, 2] > 0.9, f"{label}: node 1 strength={feats[1,2]:.3f}, expected >0.9"
+
+
+def test_degree_in_unit_interval():
+    """Fix 2: degree normalised by (d-1) must lie in [0, 1].
+    Before the fix, normalisation by top_k gave values far below 1
+    even for highly connected nodes."""
+    hs = dummy.dummy_hidden_states(n=100, seed=42)
+    ensemble = _fit(hs)
+    artifact = build_graphs(hs, ensemble)
+    for g in artifact["graphs"][:20]:
+        degrees = g.x[:, 1]
+        assert (degrees >= 0).all() and (degrees <= 1.0 + 1e-5).all(), \
+            f"degree out of [0,1]: min={degrees.min():.4f} max={degrees.max():.4f}"
+
+
+def test_edge_attr_is_raw_score_not_decisiveness():
+    """edge_attr should be raw p(is_correct) so GNN sees direction.
+    Shape must be [E, 1] (preferred for PyG layer compatibility).
+    Values must lie in (0, 1) and include both sides of 0.5."""
+    hs = dummy.dummy_hidden_states(n=200, seed=43)
+    ensemble = _fit(hs)
+    artifact = build_graphs(hs, ensemble)
+    for g in artifact["graphs"][:10]:
+        assert g.edge_attr.ndim == 2 and g.edge_attr.shape[1] == 1, \
+            f"edge_attr must be [E, 1], got {tuple(g.edge_attr.shape)}"
+    all_attrs = torch.cat([g.edge_attr.view(-1) for g in artifact["graphs"]])
+    assert all_attrs.min() >= 0.0 and all_attrs.max() <= 1.0
+    assert (all_attrs < 0.5).any() and (all_attrs > 0.5).any()
+
+
+# ------------------------------------------------------------------
 # IO round-trip
 # ------------------------------------------------------------------
 

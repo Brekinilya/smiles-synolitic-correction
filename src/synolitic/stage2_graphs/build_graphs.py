@@ -84,20 +84,38 @@ def fit_pairwise_ensemble(x_train: np.ndarray, y_train: np.ndarray) -> Synolitic
 
 
 def _build_sample_graph(x_vec: np.ndarray, pairs, scores_row: np.ndarray, d: int, top_k: int):
-    """One sample's sparsified graph + its [d, N_NODE_FEATURES] node features."""
-    confidence = np.abs(scores_row - 0.5)
-    top_idx = np.argsort(-confidence)[:top_k]
+    """One sample's sparsified graph + its [d, N_NODE_FEATURES] node features.
+
+    Two quantities per edge:
+      score (raw)   = p(is_correct=1) in [0,1]  -> stored in edge_attr so
+                      the GNN can learn the *direction* (correct- vs error-
+                      leaning pair).
+      decisiveness  = |score - 0.5| * 2          -> used for ALL topology
+                      (strength, distance, centralities).  A score of 0.02
+                      and 0.98 are equally decisive; using raw score would
+                      make error-leaning pairs look topologically weak.
+
+    Degree normalisation: divided by (d-1), the maximum possible degree,
+    not by top_k (which would give artificially small values).
+
+    Known limitation (pre-defense prototype): global top-k sparsification
+    can leave some nodes isolated.  Next version will use per-node top-k.
+    """
+    decisiveness = np.abs(scores_row - 0.5) * 2.0   # in [0, 1]
+    top_idx = np.argsort(-decisiveness)[:top_k]
 
     G = nx.Graph()
     G.add_nodes_from(range(d))
     for k in top_idx:
         i, j = pairs[k]
-        w = float(scores_row[k])
-        dist = (1.0 - w) if w >= 0.5 else w
-        G.add_edge(i, j, weight=w, distance=max(dist, 1e-6))
+        p = float(scores_row[k])
+        dec = float(decisiveness[k])
+        distance = 1.0 / max(dec, 1e-6)   # strong edge = short distance
+        G.add_edge(i, j, score=p, strength=dec, distance=distance)
 
     degree = dict(G.degree())
-    strength = dict(G.degree(weight="weight"))
+    # Fix 1: strength uses decisiveness, not raw score
+    strength = dict(G.degree(weight="strength"))
     if G.number_of_edges() > 0:
         closeness = nx.closeness_centrality(G, distance="distance")
         betweenness = nx.betweenness_centrality(G, weight="distance", normalized=True)
@@ -108,18 +126,31 @@ def _build_sample_graph(x_vec: np.ndarray, pairs, scores_row: np.ndarray, d: int
     feats = np.zeros((d, schemas.N_NODE_FEATURES), dtype=np.float32)
     for node in range(d):
         feats[node, 0] = x_vec[node]
-        feats[node, 1] = degree.get(node, 0) / max(top_k, 1)
+        # Fix 2: normalise degree by (d-1), not top_k
+        feats[node, 1] = degree.get(node, 0) / max(d - 1, 1)
         feats[node, 2] = strength.get(node, 0.0)
+        # Note: strength is weighted degree (sum of decisiveness over incident
+        # edges) and is NOT normalised to [0,1] -- it can exceed 1 for nodes
+        # with many strong edges. This is consistent with SGNN methodology
+        # (Zaikin et al., 2026). Normalisation options (per-degree or global
+        # max) are deferred as a post-pre-defense ablation.
         feats[node, 3] = closeness.get(node, 0.0)
         feats[node, 4] = betweenness.get(node, 0.0)
 
     edge_index_list, edge_attr_list = [], []
     for u, v, data in G.edges(data=True):
         edge_index_list += [[u, v], [v, u]]
-        edge_attr_list += [data["weight"], data["weight"]]
+        # edge_attr = raw score (direction signal for GNN)
+        edge_attr_list += [data["score"], data["score"]]
 
     edge_index = torch.tensor(edge_index_list, dtype=torch.int64).t().contiguous()
-    edge_attr = torch.tensor(edge_attr_list, dtype=torch.float32)
+    # shape [E, 1]: raw p(is_correct=1) as direction signal for GNN.
+    # Note: [E, 1] preferred over [E] for PyG layer compatibility.
+    # Note on scaler: current prototype uses unscaled pairwise logistic
+    # regression for fast vectorized scoring; per-pair standardization
+    # (StandardScaler + pipeline) is planned as an ablation but would
+    # require restructuring score_all -- deferred post pre-defense.
+    edge_attr = torch.tensor(edge_attr_list, dtype=torch.float32).view(-1, 1)
     return feats, edge_index, edge_attr
 
 
