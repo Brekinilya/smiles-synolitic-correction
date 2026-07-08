@@ -35,14 +35,15 @@ schemas.assert_valid("graphs", schemas.validate_graphs(artifact))
 uv sync                                        # env (torch, torch-geometric, sklearn, networkx)
 uv run pytest -q                               # contract + model tests
 uv run python scripts/make_dummy_data.py       # artifacts/dummy/{hidden_states,graphs,scores}.pt
+uv run python scripts/run_corrector.py         # stage 4 demo: Theorem-1 bounds vs empirical rates
 # stage 1 (real data):
 uv run python scripts/train_model.py           # stops inside the 0.70–0.85 accuracy band
 uv run python scripts/extract_hidden_states.py # -> artifacts/hidden_states.pt
-# stage 4:
-uv run python src/synolitic/stage4_corrector/corrector.py \
-    --scores artifacts/dummy/scores.pt \
-    --graphs artifacts/dummy/graphs.pt \
-    --hidden-states artifacts/dummy/hidden_states.pt
+# stage 4 on real artifacts:
+uv run python scripts/run_corrector.py \
+    --scores artifacts/scores.pt \
+    --graphs artifacts/graphs.pt \
+    --hidden-states artifacts/hidden_states.pt
 ```
 
 Artifacts are git-ignored; real files are shared via GitHub release assets.

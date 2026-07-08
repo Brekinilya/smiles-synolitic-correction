@@ -1,350 +1,306 @@
-"""Stage 4 Corrector.
+"""Stage 4: AI error corrector with distribution-agnostic guarantees.
 
-Fisher discriminant + Theorem 1 guarantees + confidence baseline.
+Implements Algorithm 1 and Theorem 1 of Tyukin et al., "Weakly Supervised
+Learners for Correction of AI Errors with Provable Performance Guarantees"
+(IJCNN 2024, arXiv:2402.00899); the journal version (Information Sciences
+678:120856, 2024) states the analogous bounds. Formulas below follow the
+arXiv text verbatim.
 
-Usage:
-    uv run python src/synolitic/stage4_corrector/corrector.py \
-        --scores artifacts/dummy/scores.pt \
-        --graphs artifacts/dummy/graphs.pt \
-        --hidden-states artifacts/dummy/hidden_states.pt
+Construction (single-class specialization: we moderate every answer of the
+reversal transformer, so the paper's per-class index j collapses to one
+class; S+ = samples the transformer got right, S- = its errors):
+
+* projector h maps the feature vector Phi(u) to R, oriented so that CORRECT
+  samples project HIGH;
+* threshold theta = F-_dagger(Delta), the Delta-quantile of the projections
+  of S- (errors);
+* corrector: REJECT the model's answer iff h(Phi(u)) <= theta (Algorithm 1).
+
+Theorem 1 bounds (both distribution-agnostic, DKW-based):
+
+* P(accept | model correct) >= 1 - psi(F+(theta), M+),
+* P(reject | model wrong)  >= rho(Delta, M-),
+
+  rho(a, d) = sup_eps  max{a - eps, 0} * (1 - 2 exp(-2 d eps^2)),
+  psi(a, d) = inf_eps  2 exp(-2 d eps^2) + min{1, a + eps},
+
+where F+ is the empirical CDF of correct-sample projections and M+/M- are
+the calibration counts.
+
+Independence requirement of Theorem 1: h must be chosen independently of
+the calibration sample S used for F+/F-. Therefore:
+
+* 1-D features (GNN score, softmax confidence) use the identity projector —
+  fixed a priori, the whole cal split serves as S;
+* multi-D features (synolitic graph topology) fit a Fisher discriminant on
+  one half of the cal split (cal-A) and compute theta/F+ on the other half
+  (cal-B), so the projector stays independent of S = cal-B.
+
+A second, bounds-free operating point is provided by ``youden_threshold``
+(threshold maximizing TPR + TNR on the calibration sample). It is often a
+good empirical trade-off but is tuned on both classes at once, so it does
+NOT satisfy the premise of Theorem 1 — report empirical rates only for it.
+
+Split discipline: everything here uses split == SPLIT_CAL only; report
+final numbers on split == SPLIT_TEST (see ``evaluate_corrector``).
 """
 
 from __future__ import annotations
 
-import argparse
-from pathlib import Path
-from typing import Any, cast
-from numpy.typing import NDArray
+from dataclasses import dataclass, field
+
 import numpy as np
-from synolitic.common.io import load_artifact
+
 from synolitic.common.schemas import SPLIT_CAL, SPLIT_TEST
-from sklearn.metrics import roc_auc_score
-from typing import Dict, Any
 
-def fisher_projector(phi_correct, phi_incorrect):
-    x_pos = np.asarray(phi_correct, dtype=float)
-    x_neg = np.asarray(phi_incorrect, dtype=float)
-
-    mu_pos = x_pos.mean(axis=0)
-    mu_neg = x_neg.mean(axis=0)
-
-    s_pos = np.atleast_2d(np.cov(x_pos, rowvar=False))
-    s_neg = np.atleast_2d(np.cov(x_neg, rowvar=False))
-
-    sw = s_pos + s_neg
-    sw += 1e-6 * np.eye(sw.shape[0])
-    w = np.linalg.solve(sw,mu_pos - mu_neg,)
-    n = np.linalg.norm(w)
-
-    if n > 0:
-        w /= n
-
-    return w
+_EPS_GRID = np.linspace(1e-4, 1.0, 20000)
 
 
-def project(phi, w):
-    return np.asarray(phi) @ np.asarray(w)
+def rho(a: float, d: int) -> float:
+    """Lower bound on P(new sample <= empirical a-quantile), Theorem 1."""
+    if d <= 0:
+        return 0.0
+    vals = np.maximum(a - _EPS_GRID, 0.0) * (1.0 - 2.0 * np.exp(-2.0 * d * _EPS_GRID**2))
+    return float(np.clip(vals.max(), 0.0, 1.0))
 
 
-def calibrate_threshold(
-    projected,
-    labels,
-):
-
-    z = np.asarray(projected)
-    y = np.asarray(labels, dtype=bool)
-
-    best_delta = z[0]
-    best = -1
-
-    for delta in np.unique(z):
-
-        accept = z >= delta
-
-        tpr = np.mean(
-            accept[y]
-        ) if np.any(y) else 0
-
-        tnr = np.mean(
-            ~accept[~y]
-        ) if np.any(~y) else 0
+def psi(a: float, d: int) -> float:
+    """Upper bound on P(new sample <= theta) given empirical CDF value a."""
+    if d <= 0:
+        return 1.0
+    vals = 2.0 * np.exp(-2.0 * d * _EPS_GRID**2) + np.minimum(1.0, a + _EPS_GRID)
+    return float(np.clip(vals.min(), 0.0, 1.0))
 
 
-        score = tpr + tnr
+def fisher_projector(
+    phi_correct: np.ndarray, phi_incorrect: np.ndarray, ridge: float = 1e-3
+) -> np.ndarray:
+    """Fisher linear discriminant w ~ (S_w + ridge*I)^-1 (mu+ - mu-).
 
-        if score > best:
-            best = score
-            best_delta = delta
+    Oriented so that CORRECT samples project HIGH (matches Algorithm 1's
+    reject-if-low convention). Ridge is scaled by mean(trace)/dim to keep
+    the solve stable for high-dimensional Phi with modest sample counts.
+    """
+    mu_p = phi_correct.mean(axis=0)
+    mu_m = phi_incorrect.mean(axis=0)
+    d = phi_correct.shape[1]
+    sw = np.cov(phi_correct, rowvar=False) * (len(phi_correct) - 1)
+    sw += np.cov(phi_incorrect, rowvar=False) * (len(phi_incorrect) - 1)
+    sw += np.eye(d) * max(ridge * np.trace(sw) / d, 1e-12)
+    w = np.linalg.solve(sw, mu_p - mu_m)
+    norm = np.linalg.norm(w)
+    return w / norm if norm > 0 else w
 
-    return float(best_delta)
 
-def evaluate(scores,labels,split,delta):
-    mask = split == SPLIT_TEST
+def youden_threshold(projected: np.ndarray, labels: np.ndarray) -> float:
+    """Threshold maximizing TPR + TNR (Youden's J) on the given sample.
 
-    z = scores[mask]
-    y = labels[mask].astype(bool)
+    Data-driven operating point tuned on both classes at once — often a good
+    empirical trade-off, but it does NOT satisfy the premise of Theorem 1
+    (theta must be the Delta-quantile of error projections with Delta fixed
+    a priori), so no bound is claimed for it.
+    """
+    z = np.asarray(projected, dtype=np.float64)
+    y = np.asarray(labels).astype(bool)
+    thresholds = np.unique(z)
+    accept = z[None, :] >= thresholds[:, None]
+    tpr = accept[:, y].mean(axis=1) if y.any() else np.zeros(len(thresholds))
+    tnr = (~accept[:, ~y]).mean(axis=1) if (~y).any() else np.zeros(len(thresholds))
+    return float(thresholds[int(np.argmax(tpr + tnr))])
 
-    accept = z >= delta
-    reject = ~accept
 
-    correct = y
-    incorrect = ~y
+@dataclass
+class Corrector:
+    """Fitted corrector: projector + threshold + Theorem-1 bounds."""
 
-    return {
-        "n_test": int(mask.sum()),
-        "acceptance_rate":
-            float(np.mean(accept)),
-        "rejection_rate":
-            float(np.mean(reject)),
-        "p_accept_given_correct":
-            float(np.mean(accept[correct]))
-            if np.any(correct)
-            else np.nan,
-        "p_reject_given_incorrect":
-            float(np.mean(reject[incorrect]))
-            if np.any(incorrect)
-            else np.nan,
-        "precision_accept":
-            float(np.mean(y[accept]))
-            if np.any(accept)
-            else np.nan,
-        "precision_reject":
-            float(np.mean(~y[reject]))
-            if np.any(reject)
-            else np.nan,
-        "accepted_count":
-            int(np.sum(accept)),
-        "rejected_count":
-            int(np.sum(reject)),
-        "correct_total":
-            int(np.sum(correct)),
-        "incorrect_total":
-            int(np.sum(incorrect)),
-    }
+    delta: float
+    theta: float
+    m_plus: int
+    m_minus: int
+    f_plus_at_theta: float          # empirical CDF of correct projections at theta
+    accept_bound: float             # 1 - psi(F+(theta), M+)
+    reject_bound: float             # rho(Delta, M-)
+    w: np.ndarray | None = None     # None => identity projector (1-D Phi)
+    feature_name: str = "phi"
+    notes: dict = field(default_factory=dict)
 
-def rho(a, d):
-    eps = np.linspace(1e-8,1,10000)
-    v = (np.maximum(0, a-eps)*(1-2*np.exp(-2*d*eps**2)))
-    return float(v.max())
+    def project(self, phi: np.ndarray) -> np.ndarray:
+        t = np.asarray(phi, dtype=np.float64)
+        if t.ndim == 2 and t.shape[1] == 1:
+            t = t[:, 0]
+        if self.w is not None:
+            t = t @ self.w
+        return t
 
-def psi(a, d):
-    eps = np.linspace(1e-8,1,10000,)
-    v = np.minimum(1,2*np.exp(-2*d*eps**2)+ a + eps)
-    return float(v.min())
+    def accept_mask(self, phi: np.ndarray) -> np.ndarray:
+        """True = accept the model's answer; False = reject (Algorithm 1)."""
+        return self.project(phi) > self.theta
 
-def empirical_cdf(x, t):
-    return float(np.mean(np.asarray(x)<=t))
 
-def empirical_quantile(x,q):
-    x=np.sort(np.asarray(x))
-    k=int(np.ceil(q*len(x)))-1
-    k=max(0,min(k,len(x)-1))
+def _quantile_inf(values: np.ndarray, level: float) -> float:
+    """Generalized inverse CDF F_dagger(level) = inf{s : F(s) >= level}."""
+    return float(np.quantile(values, level, method="inverted_cdf"))
 
-    return float(x[k])
 
-def theoretical_bounds(theta,correct,incorrect):
-    delta_cdf = empirical_cdf(incorrect, theta)
-    a = empirical_cdf(correct,theta)
+def fit_corrector(
+    phi: np.ndarray,
+    is_correct: np.ndarray,
+    split: np.ndarray,
+    delta: float = 0.8,
+    fisher_frac: float = 0.5,
+    seed: int = 0,
+    feature_name: str = "phi",
+) -> Corrector:
+    """Fit Algorithm 1 on the calibration split.
 
-    return {
-        "accept_lb":1-psi(a,len(correct)),
-        "reject_lb":rho(delta_cdf,len(incorrect)),
-        "m_plus":len(correct),
-        "m_minus":len(incorrect),
-        "theta": theta,
-        "delta": delta_cdf,
-        "a_plus":a
-    }
+    Args:
+        phi: [N, d] or [N] features. 1-D features must already be oriented
+            "higher = more likely correct" (true for GNN score = P(correct)
+            and for softmax confidence).
+        is_correct / split: [N] int8 arrays aligned with phi.
+        delta: target quantile of error projections (the paper's Delta).
+        fisher_frac: fraction of cal rows used to fit the Fisher projector
+            when phi is multi-dimensional (rest forms S for theta/F+/bounds).
+    """
+    phi = np.asarray(phi, dtype=np.float64)
+    if phi.ndim == 1:
+        phi = phi[:, None]
+    is_correct = np.asarray(is_correct).astype(bool)
+    cal = np.asarray(split) == SPLIT_CAL
+    if not cal.any():
+        raise ValueError("no calibration rows (split == SPLIT_CAL) found")
 
-def graphs_to_features(graph_artifact, expected_n: int) -> NDArray[np.float64]:
-    graphs = graph_artifact["graphs"]
-    feats = np.full((expected_n, 15), np.nan) 
-    
-    for g in graphs:
-        idx = int(g.idx.item()) 
-        x = g.x.detach().cpu().numpy()
-        feats[idx] = np.concatenate([x.mean(axis=0), x.std(axis=0), x.max(axis=0)])
-        
-    if np.isnan(feats).any():
-        raise ValueError("Не все индексы из scores.pt покрыты графами!")
-    return feats
-
-def run_confidence_baseline(hidden):
-    confidence = hidden["confidence"]
-
-    correct = hidden["is_correct"]
-
-    split = hidden["split"]
-
-    if hasattr(confidence,"numpy"):
-        confidence=confidence.numpy()
-
-    if hasattr(correct,"numpy"):
-        correct=correct.numpy()
-
-    if hasattr(split,"numpy"):
-        split=split.numpy()
-
-    cal = split==SPLIT_CAL
-
-    delta = calibrate_threshold(confidence[cal],correct[cal])
-
-    return evaluate(confidence,correct,split,delta)
-
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--scores", type=Path, required=True)
-    p.add_argument("--graphs", type=Path, required=True)
-    p.add_argument("--hidden-states", type=Path, required=True)
-    args = p.parse_args()
-
-    scores_art = cast(dict[str, Any], load_artifact(args.scores))
-    scores = np.asarray(scores_art["scores"], dtype=float)
-    labels = np.asarray(scores_art["is_correct"], dtype=bool)
-    split = np.asarray(scores_art["split"])
-
-    cal = split == SPLIT_CAL
-    test = split == SPLIT_TEST
-
-    print("\n" + "=" * 80)
-    print(" " * 20 + "STAGE 4: SYNONLITIC ERROR CORRECTOR")
-    print("=" * 80)
-
-    print("\n[DATASET STATISTICS]")
-    print(f"  Total samples        : {len(scores)}")
-    print(f"  Calibration (split=1): {cal.sum():<5} (correct: {(cal & labels).sum()}, incorrect: {(cal & ~labels).sum()})")
-    print(f"  Test (split=2)       : {test.sum():<5} (correct: {(test & labels).sum()}, incorrect: {(test & ~labels).sum()})")
-
-    def print_method_block(name: str, auc_cal: float, auc_test: float, delta: float, 
-                           feature_dim: int | None, eval_dict: dict, bounds_dict: dict | None = None):
-        print("\n" + "-" * 80)
-        print(f"[{name}]")
-        print("-" * 80)
-        if feature_dim is not None:
-            print(f"  Feature dimension    : {feature_dim}")
-        print(f"  Threshold Δ          : {delta:.6f}")
-        print(f"  AUC (calibration)    : {auc_cal:.3f}")
-        print(f"  AUC (test)           : {auc_test:.3f}")
-        print(f"  Acceptance rate      : {eval_dict['acceptance_rate']:.3f}")
-        print(f"  P(accept | correct)  : {eval_dict['p_accept_given_correct']:.3f}")
-        print(f"  P(reject | error)    : {eval_dict['p_reject_given_incorrect']:.3f}")
-        
-        if bounds_dict is not None:
-            print(f"\n  [Theoretical bounds (Tyukin Th.1)]")
-            print(f"    Accept lower bound : {bounds_dict['accept_lb']:.3f}")
-            print(f"    Reject lower bound : {bounds_dict['reject_lb']:.3f}")
-
-    delta_gnn = calibrate_threshold(scores[cal], labels[cal])
-    result_gnn = evaluate(scores, labels, split, delta_gnn)
-    auc_gnn_cal = roc_auc_score(labels[cal], scores[cal])
-    auc_gnn_test = roc_auc_score(labels[test], scores[test])
-
-    print_method_block(
-        name="1. GNN SCORE (baseline from Stage 3)",
-        auc_cal=auc_gnn_cal,
-        auc_test=auc_gnn_test,
-        delta=delta_gnn,
-        feature_dim=None,
-        eval_dict=result_gnn
-    )
-
-    graph_art = load_artifact(args.graphs)
-    phi = graphs_to_features(graph_art, expected_n=len(scores))
-
-    w = fisher_projector(phi[cal & labels], phi[cal & (~labels)])
-    z = project(phi, w)
-
-    fisher_delta = calibrate_threshold(z[cal], labels[cal])
-    fisher_eval = evaluate(z, labels, split, fisher_delta)
-    bounds = theoretical_bounds(fisher_delta, z[cal & labels], z[cal & (~labels)])
-    fisher_auc_cal = roc_auc_score(labels[cal], z[cal])
-    fisher_auc_test = roc_auc_score(labels[test], z[test])
-
-    print_method_block(
-        name="2. FISHER ON SYNONLITIC GRAPH FEATURES (paper-faithful Φ)",
-        auc_cal=fisher_auc_cal,
-        auc_test=fisher_auc_test,
-        delta=fisher_delta,
-        feature_dim=phi.shape[-1],
-        eval_dict=fisher_eval,
-        bounds_dict=bounds
-    )
-
-    hidden = cast(Dict[str, Any], load_artifact(args.hidden_states))
-    baseline = run_confidence_baseline(hidden)
-    
-    confidence = hidden["confidence"]
-    if hasattr(confidence, "numpy"):
-        confidence = confidence.numpy()
-    confidence_auc_cal = roc_auc_score(labels[cal], confidence[cal])
-    confidence_auc_test = roc_auc_score(labels[test], confidence[test])
-
-    delta_conf = calibrate_threshold(confidence[cal], labels[cal])
-
-    print_method_block(
-        name="3. CONFIDENCE BASELINE (softmax rejection from Stage 1)",
-        auc_cal=confidence_auc_cal,
-        auc_test=confidence_auc_test,
-        delta=delta_conf,
-        feature_dim=None,
-        eval_dict=baseline
-    )
-
-    X_raw = hidden["X"] 
-    if hasattr(X_raw, "numpy"):
-        X_raw = X_raw.numpy()
-    X_raw = np.asarray(X_raw, dtype=float)
-
-    w_raw = fisher_projector(X_raw[cal & labels], X_raw[cal & (~labels)])
-    z_raw = project(X_raw, w_raw)
-
-    raw_delta = calibrate_threshold(z_raw[cal], labels[cal])
-    raw_eval = evaluate(z_raw, labels, split, raw_delta)
-    raw_auc_cal = roc_auc_score(labels[cal], z_raw[cal])
-    raw_auc_test = roc_auc_score(labels[test], z_raw[test])
-
-    print_method_block(
-        name="4. FISHER ON RAW FEATURES X (H1 baseline)",
-        auc_cal=raw_auc_cal,
-        auc_test=raw_auc_test,
-        delta=raw_delta,
-        feature_dim=X_raw.shape[-1],
-        eval_dict=raw_eval
-    )
-
-    print("\n" + "=" * 80)
-    print(" " * 28 + "STAGE 4 SUMMARY TABLE")
-    print("=" * 80)
-    header = f"{'Method':<26}{'AUC':<9}{'P(acc|corr)':<15}{'P(rej|incorr)':<16}{'Δ':<10}"
-    print(header)
-    print("-" * 80)
-    
-    print(f"{'GNN score':<26}{auc_gnn_test:<9.3f}{result_gnn['p_accept_given_correct']:<15.3f}"
-          f"{result_gnn['p_reject_given_incorrect']:<16.3f}{delta_gnn:<10.3f}")
-    
-    print(f"{'Confidence':<26}{confidence_auc_test:<9.3f}{baseline['p_accept_given_correct']:<15.3f}"
-          f"{baseline['p_reject_given_incorrect']:<16.3f}{delta_conf:<10.3f}")
-    
-    print(f"{'Fisher Raw X (H1)':<26}{raw_auc_test:<9.3f}{raw_eval['p_accept_given_correct']:<15.3f}"
-          f"{raw_eval['p_reject_given_incorrect']:<16.3f}{raw_delta:<10.3f}")
-    
-    print(f"{'Fisher Synolitic Φ':<26}{fisher_auc_test:<9.3f}{fisher_eval['p_accept_given_correct']:<15.3f}"
-          f"{fisher_eval['p_reject_given_incorrect']:<16.3f}{fisher_delta:<10.3f}")
-
-    print("\n" + "-" * 80)
-    print("[HYPOTHESIS H1 CHECK]")
-    print("-" * 80)
-    print(f"  H1: Synolitic graph features should outperform raw features X")
-    print(f"  Fisher Synolitic Φ AUC : {fisher_auc_test:.3f}")
-    print(f"  Fisher Raw X AUC       : {raw_auc_test:.3f}")
-    
-    if fisher_auc_test >= raw_auc_test:
-        print(f"  ✅ H1 is SUPPORTED: Synolitic features AUC ({fisher_auc_test:.3f}) >= Raw features AUC ({raw_auc_test:.3f})")
+    cal_idx = np.flatnonzero(cal)
+    w = None
+    notes: dict = {}
+    if phi.shape[1] > 1:
+        rng = np.random.default_rng(seed)
+        perm = rng.permutation(len(cal_idx))
+        n_a = int(round(fisher_frac * len(cal_idx)))
+        idx_a, idx_b = cal_idx[perm[:n_a]], cal_idx[perm[n_a:]]
+        y_a = is_correct[idx_a]
+        if y_a.all() or not y_a.any():
+            raise ValueError("cal-A has a single class; cannot fit Fisher projector")
+        w = fisher_projector(phi[idx_a][y_a], phi[idx_a][~y_a])
+        notes["fisher_fit_on"] = int(len(idx_a))
+        s_idx = idx_b
     else:
-        print(f"  ❌ H1 is NOT SUPPORTED: Synolitic features AUC ({fisher_auc_test:.3f}) < Raw features AUC ({raw_auc_test:.3f})")
-    
-    print("=" * 80 + "\n")
+        s_idx = cal_idx  # identity projector is a priori => whole cal is S
+
+    t = phi[s_idx] @ w if w is not None else phi[s_idx, 0]
+    y = is_correct[s_idx]
+    t_minus, t_plus = t[~y], t[y]
+    if len(t_minus) == 0 or len(t_plus) == 0:
+        raise ValueError("S+ or S- is empty on the calibration split")
+
+    theta = _quantile_inf(t_minus, delta)
+    f_plus_at_theta = float((t_plus <= theta).mean())
+    m_plus, m_minus = int(len(t_plus)), int(len(t_minus))
+
+    return Corrector(
+        delta=delta,
+        theta=theta,
+        m_plus=m_plus,
+        m_minus=m_minus,
+        f_plus_at_theta=f_plus_at_theta,
+        accept_bound=float(np.clip(1.0 - psi(f_plus_at_theta, m_plus), 0.0, 1.0)),
+        reject_bound=rho(delta, m_minus),
+        w=w,
+        feature_name=feature_name,
+        notes=notes,
+    )
 
 
-if __name__ == "__main__":
-    main()
+def evaluate_corrector(
+    corrector: Corrector,
+    phi: np.ndarray,
+    is_correct: np.ndarray,
+    split: np.ndarray,
+) -> dict:
+    """Empirical test-split performance vs the Theorem-1 bounds."""
+    test = np.asarray(split) == SPLIT_TEST
+    if not test.any():
+        raise ValueError("no test rows (split == SPLIT_TEST) found")
+    phi = np.asarray(phi, dtype=np.float64)
+    if phi.ndim == 1:
+        phi = phi[:, None]
+    y = np.asarray(is_correct).astype(bool)[test]
+    t = corrector.project(phi[test])
+    accept = t > corrector.theta
+
+    try:
+        from sklearn.metrics import roc_auc_score
+
+        auc_test = float(roc_auc_score(y, t))
+    except ValueError:
+        auc_test = float("nan")
+
+    base_accuracy = float(y.mean())
+    n_acc = int(accept.sum())
+    return {
+        "feature": corrector.feature_name,
+        "delta": corrector.delta,
+        "theta": corrector.theta,
+        "m_plus_cal": corrector.m_plus,
+        "m_minus_cal": corrector.m_minus,
+        "bound_accept_given_correct": corrector.accept_bound,
+        "bound_reject_given_error": corrector.reject_bound,
+        "emp_accept_given_correct": float(accept[y].mean()) if y.any() else float("nan"),
+        "emp_reject_given_error": float((~accept[~y]).mean()) if (~y).any() else float("nan"),
+        "auc_test": auc_test,
+        "base_accuracy": base_accuracy,
+        "precision_on_accepted": float(y[accept].mean()) if n_acc else float("nan"),
+        "accepted_fraction": float(accept.mean()),
+        "n_test": int(test.sum()),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Feature builders (Phi) from the pipeline artifacts
+# ---------------------------------------------------------------------------
+
+def phi_from_scores(scores_artifact: dict) -> np.ndarray:
+    """1-D Phi = GNN score = P(is_correct). Higher = more likely correct."""
+    return scores_artifact["scores"].numpy().astype(np.float64)
+
+
+def phi_from_confidence(hidden_states: dict) -> np.ndarray:
+    """1-D Phi = model softmax confidence (the baseline the paper-style
+    corrector must beat)."""
+    return hidden_states["confidence"].numpy().astype(np.float64)
+
+
+def phi_from_graphs(graphs_artifact: dict, feature_cols: tuple[int, ...] = (1, 2, 3, 4)) -> np.ndarray:
+    """Multi-D Phi = concatenated topological node features of the synolitic
+    graph (defaults to degree/strength/closeness/betweenness columns; column
+    0 is the raw pooled hidden-state value). Rows ordered by ``data.idx``."""
+    graphs = graphs_artifact["graphs"]
+    order = np.argsort([int(g.idx) for g in graphs])
+    return np.stack(
+        [graphs[i].x[:, list(feature_cols)].numpy().ravel() for i in order]
+    ).astype(np.float64)
+
+
+def phi_graph_summary(graphs_artifact: dict) -> np.ndarray:
+    """Compact per-graph Phi [N, 15]: mean/std/max over the 64 nodes of the
+    5 node features. Coarser than ``phi_from_graphs`` (which keeps per-node
+    structure) but far lower-dimensional — keep both as ablations."""
+    graphs = graphs_artifact["graphs"]
+    n = len(graphs)
+    width = 3 * graphs[0].x.shape[1]
+    feats = np.full((n, width), np.nan)
+    for g in graphs:
+        idx = int(g.idx)
+        if not 0 <= idx < n:
+            raise ValueError(f"graph idx {idx} outside 0..{n - 1}")
+        x = g.x.numpy()
+        feats[idx] = np.concatenate([x.mean(axis=0), x.std(axis=0), x.max(axis=0)])
+    if np.isnan(feats).any():
+        raise ValueError("graphs do not cover all indices 0..N-1")
+    return feats.astype(np.float64)
+
+
+def phi_raw_x(hidden_states: dict) -> np.ndarray:
+    """Multi-D Phi = raw pooled hidden states X — the H1 comparison row
+    (does the synolitic graph add anything over raw features?)."""
+    return hidden_states["X"].numpy().astype(np.float64)
