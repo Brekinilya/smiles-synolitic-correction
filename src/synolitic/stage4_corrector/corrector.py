@@ -19,6 +19,7 @@ import numpy as np
 from synolitic.common.io import load_artifact
 from synolitic.common.schemas import SPLIT_CAL, SPLIT_TEST
 from sklearn.metrics import roc_auc_score
+from typing import Dict, Any
 
 def fisher_projector(phi_correct, phi_incorrect):
     x_pos = np.asarray(phi_correct, dtype=float)
@@ -269,10 +270,10 @@ def main():
         bounds_dict=bounds
     )
 
-    hidden = load_artifact(args.hidden_states)
+    hidden = cast(Dict[str, Any], load_artifact(args.hidden_states))
     baseline = run_confidence_baseline(hidden)
     
-    confidence = hidden["confidence"] #type: ignore
+    confidence = hidden["confidence"]
     if hasattr(confidence, "numpy"):
         confidence = confidence.numpy()
     confidence_auc_cal = roc_auc_score(labels[cal], confidence[cal])
@@ -289,7 +290,7 @@ def main():
         eval_dict=baseline
     )
 
-    X_raw = hidden["X"] #type: ignore
+    X_raw = hidden["X"] 
     if hasattr(X_raw, "numpy"):
         X_raw = X_raw.numpy()
     X_raw = np.asarray(X_raw, dtype=float)
