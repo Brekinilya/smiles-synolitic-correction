@@ -21,7 +21,7 @@ Each stage develops against **dummy artifacts** with identical schemas, so all
 four stages proceed in parallel; swapping in the real files needs no code
 changes. The schemas and their validators live in
 [`src/synolitic/common/schemas.py`](src/synolitic/common/schemas.py) — that
-file is the single source of truth. Validate everything you produce *and*
+file is the single source of truth. Validate everything you produce _and_
 consume:
 
 ```python
@@ -38,6 +38,11 @@ uv run python scripts/make_dummy_data.py       # artifacts/dummy/{hidden_states,
 # stage 1 (real data):
 uv run python scripts/train_model.py           # stops inside the 0.70–0.85 accuracy band
 uv run python scripts/extract_hidden_states.py # -> artifacts/hidden_states.pt
+# stage 4:
+uv run python src/synolitic/stage4_corrector/corrector.py \
+    --scores artifacts/dummy/scores.pt \
+    --graphs artifacts/dummy/graphs.pt \
+    --hidden-states artifacts/dummy/hidden_states.pt
 ```
 
 Artifacts are git-ignored; real files are shared via GitHub release assets.
@@ -47,11 +52,11 @@ Artifacts are git-ignored; real files are shared via GitHub release assets.
 `split` codes: `0=train`, `1=cal`, `2=test` (60/20/20). **This is the one rule
 that keeps the theoretical bounds honest:**
 
-| split | who uses it |
-|---|---|
+| split   | who uses it                                                        |
+| ------- | ------------------------------------------------------------------ |
 | `train` | stage 2 fits the 2016 pairwise classifiers; stage 3 trains the GNN |
-| `cal`   | stage 4 fits the Fisher projector and calibrates thresholds Δ |
-| `test`  | final reported numbers only — never fit/calibrate on it |
+| `cal`   | stage 4 fits the Fisher projector and calibrates thresholds Δ      |
+| `test`  | final reported numbers only — never fit/calibrate on it            |
 
 Model training data is generated on the fly with seeds disjoint from the
 extraction set, so it never overlaps any split.
@@ -60,23 +65,23 @@ extraction set, so it never overlaps any split.
 
 ### `hidden_states.pt` (stage 1 → 2) — dict of tensors + `meta`
 
-| key | shape / dtype | meaning |
-|---|---|---|
-| `X` | `[N, 64] float32` | mean over non-PAD source positions of the final-LN encoder output |
-| `X_layers` | `[N, 2, 64] float32` | same pooling per encoder layer (optional, for layer analysis) |
-| `input_tokens` | `[N, Ls] int64` | source digits, PAD-padded |
-| `target_tokens` | `[N, Ls] int64` | reversed digits, PAD-padded |
-| `pred_tokens` | `[N, T] int64` | greedy output incl. EOS, PAD after it |
-| `lengths` | `[N] int64` | true sequence lengths |
-| `is_correct` | `[N] int8` | exact match of the full sequence (`schemas.exact_match`) |
-| `confidence` | `[N] float32` | mean max-softmax over generated steps (baseline for stage 4) |
-| `split` | `[N] int8` | 0/1/2, see split discipline |
-| `attn_idx` | `[N_sub] int64` | rows covered by the attention dump |
+| key             | shape / dtype                   | meaning                                                              |
+| --------------- | ------------------------------- | -------------------------------------------------------------------- |
+| `X`             | `[N, 64] float32`               | mean over non-PAD source positions of the final-LN encoder output    |
+| `X_layers`      | `[N, 2, 64] float32`            | same pooling per encoder layer (optional, for layer analysis)        |
+| `input_tokens`  | `[N, Ls] int64`                 | source digits, PAD-padded                                            |
+| `target_tokens` | `[N, Ls] int64`                 | reversed digits, PAD-padded                                          |
+| `pred_tokens`   | `[N, T] int64`                  | greedy output incl. EOS, PAD after it                                |
+| `lengths`       | `[N] int64`                     | true sequence lengths                                                |
+| `is_correct`    | `[N] int8`                      | exact match of the full sequence (`schemas.exact_match`)             |
+| `confidence`    | `[N] float32`                   | mean max-softmax over generated steps (baseline for stage 4)         |
+| `split`         | `[N] int8`                      | 0/1/2, see split discipline                                          |
+| `attn_idx`      | `[N_sub] int64`                 | rows covered by the attention dump                                   |
 | `enc_self_attn` | `[N_sub, 2, 4, Ls, Ls] float32` | per-layer, per-head attention (H3 analysis + raw-attention baseline) |
-| `dec_self_attn` | `[N_sub, 2, 4, T, T] float32` | |
-| `cross_attn` | `[N_sub, 2, 4, T, Ls] float32` | |
+| `dec_self_attn` | `[N_sub, 2, 4, T, T] float32`   |                                                                      |
+| `cross_attn`    | `[N_sub, 2, 4, T, Ls] float32`  |                                                                      |
 
-Vocabulary (also part of the contract): `PAD=0, BOS=1, EOS=2`, digit *d* ↦
+Vocabulary (also part of the contract): `PAD=0, BOS=1, EOS=2`, digit _d_ ↦
 token `d+3`. Class balance is ~4:1 (model held at ~70–85% accuracy) — use
 class weights and report ROC-AUC.
 
@@ -115,14 +120,14 @@ tests/              contract tests + stage-1 smoke tests
 
 ## Timeline (pre-defense: July 12, 23:00 UTC+3)
 
-| date | milestone |
-|---|---|
-| Jul 5 | roles fixed, contracts v1.1, repo + dummies + contract tests |
+| date    | milestone                                                             |
+| ------- | --------------------------------------------------------------------- |
+| Jul 5   | roles fixed, contracts v1.1, repo + dummies + contract tests          |
 | Jul 6–8 | parallel development on dummies; real `hidden_states.pt` by Jul 8 EOD |
-| Jul 9 | stages 2–4 switch to real data |
-| Jul 10 | integration day: full pipeline run, metrics table, figures |
-| Jul 11 | presentation draft + rehearsal |
-| Jul 12 | polish, submit |
+| Jul 9   | stages 2–4 switch to real data                                        |
+| Jul 10  | integration day: full pipeline run, metrics table, figures            |
+| Jul 11  | presentation draft + rehearsal                                        |
+| Jul 12  | polish, submit                                                        |
 
 Baselines for the results table: softmax-confidence rejection, logistic
 regression / MLP on raw `X`, GNN on synolitic graphs, corrector on synolitic
@@ -130,8 +135,8 @@ features vs corrector on raw features (hypothesis H1).
 
 ## References
 
-- Zaikin et al., *Overcoming the Curse of Dimensionality with Synolitic AI*, Technologies 14(2):84, 2026.
-- Tyukin et al., *Coping with AI Errors with Provable Guarantees*, Information Sciences 678:120856, 2024.
-- Tyukin et al., *Weakly Supervised Learners for Correction of AI Errors with Provable Performance Guarantees*, IJCNN 2024.
-- Clark et al., *What Does BERT Look At?*, BlackboxNLP 2019.
-- Vaswani et al., *Attention Is All You Need*, NeurIPS 2017.
+- Zaikin et al., _Overcoming the Curse of Dimensionality with Synolitic AI_, Technologies 14(2):84, 2026.
+- Tyukin et al., _Coping with AI Errors with Provable Guarantees_, Information Sciences 678:120856, 2024.
+- Tyukin et al., _Weakly Supervised Learners for Correction of AI Errors with Provable Performance Guarantees_, IJCNN 2024.
+- Clark et al., _What Does BERT Look At?_, BlackboxNLP 2019.
+- Vaswani et al., _Attention Is All You Need_, NeurIPS 2017.
