@@ -23,7 +23,327 @@ Develop against the dummy artifact:
 
 from __future__ import annotations
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.loader import DataLoader
+from torch_geometric.nn import GATv2Conv, GCNConv, global_mean_pool, global_max_pool
+from sklearn.metrics import roc_auc_score
+import numpy as np
+import copy
+import warnings
+warnings.filterwarnings('ignore')
 
-def train_gnn(graphs_artifact: dict, arch: str = "gatv2") -> dict:
-    """Train the GNN and return the scores artifact (see module docstring)."""
-    raise NotImplementedError("role 3")
+from synolitic.common import schemas
+from synolitic.common.io import load_artifact, save_artifact
+
+
+class GNNErrorClassifier(nn.Module):
+    """GNN classifier on synolitic graphs only."""
+    def __init__(self, 
+                 in_channels=5,
+                 hidden=128,
+                 out=1,
+                 dropout=0.3,
+                 arch='gcn',
+                 use_edge_attr=True):
+        super().__init__()
+        
+        self.use_edge_attr = use_edge_attr
+        self.arch = arch
+        
+        if arch == 'gat':
+            if use_edge_attr:
+                self.conv1 = GATv2Conv(in_channels, hidden, heads=2, concat=False, 
+                                       dropout=dropout, edge_dim=1)
+                self.conv2 = GATv2Conv(hidden, hidden, heads=1, concat=False, 
+                                       dropout=dropout, edge_dim=1)
+                self.conv3 = GATv2Conv(hidden, hidden, heads=1, concat=False, 
+                                       dropout=dropout, edge_dim=1)
+            else:
+                self.conv1 = GATv2Conv(in_channels, hidden, heads=2, concat=False, dropout=dropout)
+                self.conv2 = GATv2Conv(hidden, hidden, heads=1, concat=False, dropout=dropout)
+                self.conv3 = GATv2Conv(hidden, hidden, heads=1, concat=False, dropout=dropout)
+        elif arch == 'gcn':
+            self.conv1 = GCNConv(in_channels, hidden)
+            self.conv2 = GCNConv(hidden, hidden)
+            self.conv3 = GCNConv(hidden, hidden)
+        else:
+            raise ValueError(f"Unknown arch: {arch}")
+        
+        self.bn1 = nn.BatchNorm1d(hidden)
+        self.bn2 = nn.BatchNorm1d(hidden)
+        self.bn3 = nn.BatchNorm1d(hidden)
+        
+        self.lin1 = nn.Linear(hidden * 2, hidden)
+        self.lin2 = nn.Linear(hidden, out)
+        self.dropout = dropout
+        
+    def forward(self, data):
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+        
+        x = (x - x.mean(dim=0, keepdim=True)) / (x.std(dim=0, keepdim=True) + 1e-6)
+        
+        if self.use_edge_attr and self.arch == 'gat':
+            x = self.conv1(x, edge_index, edge_attr=data.edge_attr)
+        else:
+            x = self.conv1(x, edge_index)
+        x = F.elu(x)
+        x = self.bn1(x)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        
+        if self.use_edge_attr and self.arch == 'gat':
+            x = self.conv2(x, edge_index, edge_attr=data.edge_attr)
+        else:
+            x = self.conv2(x, edge_index)
+        x = F.elu(x)
+        x = self.bn2(x)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        
+        if self.use_edge_attr and self.arch == 'gat':
+            x = self.conv3(x, edge_index, edge_attr=data.edge_attr)
+        else:
+            x = self.conv3(x, edge_index)
+        x = F.elu(x)
+        x = self.bn3(x)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        
+        x_mean = global_mean_pool(x, batch)
+        x_max = global_max_pool(x, batch)
+        x_pool = torch.cat([x_mean, x_max], dim=1)
+        
+        x = F.elu(self.lin1(x_pool))
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        logits = self.lin2(x).squeeze(-1)
+        
+        return logits
+
+
+def train_gnn(
+    graphs_artifact: dict,
+    num_epochs: int = 150,
+    batch_size: int = 128,
+    lr: float = 0.001,
+    hidden: int = 128,
+    dropout: float = 0.3,
+    weight_decay: float = 1e-4,
+    arch: str = 'gcn',
+    use_edge_attr: bool = True,
+    patience: int = 40,
+    n_ensemble: int = 5,
+    device=None,
+) -> dict:
+    
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+    
+    graphs = graphs_artifact["graphs"]
+    print(f"Total graphs: {len(graphs)}")
+    
+    train_graphs = [g for g in graphs if g.split == schemas.SPLIT_TRAIN]
+    cal_graphs = [g for g in graphs if g.split == schemas.SPLIT_CAL]
+    test_graphs = [g for g in graphs if g.split == schemas.SPLIT_TEST]
+    
+    print(f"Train: {len(train_graphs)}, Cal: {len(cal_graphs)}, Test: {len(test_graphs)}")
+    
+    train_labels = [g.y.item() for g in train_graphs]
+    n_pos = sum(train_labels)
+    n_neg = len(train_labels) - n_pos
+    pos_weight = torch.tensor([n_neg / max(n_pos, 1)], device=device)
+    print(f"Class balance: pos={n_pos}, neg={n_neg}, pos_weight={pos_weight.item():.2f}")
+    
+    train_loader = DataLoader(train_graphs, batch_size=batch_size, shuffle=True)
+    cal_loader = DataLoader(cal_graphs, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_graphs, batch_size=batch_size, shuffle=False)
+    
+    print(f"\n=== Training ensemble of {n_ensemble} models ===")
+    print("Model\tBest_Cal_AUC\tTest_AUC")
+    
+    all_ensemble_preds = []
+    best_cal_aucs = []
+    test_aucs = []
+    
+    for ensemble_idx in range(n_ensemble):
+        seed = 42 + ensemble_idx * 13
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        
+        model = GNNErrorClassifier(
+            in_channels=schemas.N_NODE_FEATURES,
+            hidden=hidden,
+            dropout=dropout,
+            arch=arch,
+            use_edge_attr=use_edge_attr
+        ).to(device)
+        
+        if ensemble_idx == 0:
+            total_params = sum(p.numel() for p in model.parameters())
+            print(f"Model params: {total_params:,}")
+        
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="max", patience=20, factor=0.5
+        )
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        
+        best_cal_auc = 0.0
+        best_state = None
+        wait = 0
+        
+        for epoch in range(num_epochs):
+            model.train()
+            total_loss = 0.0
+            for batch in train_loader:
+                batch = batch.to(device)
+                optimizer.zero_grad()
+                logits = model(batch)
+                loss = criterion(logits, batch.y.float())
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                total_loss += loss.item()
+            
+            model.eval()
+            cal_probs, cal_labels = [], []
+            with torch.no_grad():
+                for batch in cal_loader:
+                    batch = batch.to(device)
+                    logits = model(batch)
+                    probs = torch.sigmoid(logits).cpu().numpy()
+                    cal_probs.extend(probs)
+                    cal_labels.extend(batch.y.cpu().numpy())
+            
+            cal_auc = roc_auc_score(cal_labels, cal_probs) if len(set(cal_labels)) > 1 else 0.5
+            scheduler.step(cal_auc)
+            
+            if cal_auc > best_cal_auc:
+                best_cal_auc = cal_auc
+                best_state = copy.deepcopy(model.state_dict())
+                wait = 0
+            else:
+                wait += 1
+            
+            if (epoch + 1) % 10 == 0:
+                current_lr = optimizer.param_groups[0]["lr"]
+                print(f"  Epoch {epoch+1:3d}: loss={total_loss/len(train_loader):.4f}, "
+                      f"cal_auc={cal_auc:.4f}, best={best_cal_auc:.4f}, lr={current_lr:.6f}")
+            
+            if wait >= patience:
+                break
+        
+        if best_state is not None:
+            model.load_state_dict(best_state)
+        
+        model.eval()
+        test_probs, test_labels = [], []
+        with torch.no_grad():
+            for batch in test_loader:
+                batch = batch.to(device)
+                logits = model(batch)
+                probs = torch.sigmoid(logits).cpu().numpy()
+                test_probs.extend(probs)
+                test_labels.extend(batch.y.cpu().numpy())
+        
+        test_auc = roc_auc_score(test_labels, test_probs)
+        print(f"  {ensemble_idx+1}\t{best_cal_auc:.4f}\t\t{test_auc:.4f}")
+        
+        best_cal_aucs.append(best_cal_auc)
+        test_aucs.append(test_auc)
+        
+        model_preds = np.zeros(len(graphs), dtype=np.float32)
+        model.eval()
+        with torch.no_grad():
+            for g in graphs:
+                idx = g.idx.item()
+                g = g.to(device)
+                logit = model(g)
+                model_preds[idx] = torch.sigmoid(logit).item()
+        
+        all_ensemble_preds.append(model_preds)
+    
+    ensemble_preds = np.mean(all_ensemble_preds, axis=0)
+    
+    test_mask = np.array([g.split.item() for g in graphs]) == schemas.SPLIT_TEST
+    test_labels_all = np.array([g.y.item() for g in graphs])
+    ensemble_auc = roc_auc_score(test_labels_all[test_mask], ensemble_preds[test_mask])
+    print(f"\n Ensemble Test ROC-AUC: {ensemble_auc:.4f}")
+    
+    all_splits = np.array([g.split.item() for g in graphs], dtype=np.int8)
+    all_labels = np.array([g.y.item() for g in graphs], dtype=np.int8)
+    
+    scores_artifact = {
+        "scores": torch.from_numpy(ensemble_preds).float(),
+        "is_correct": torch.from_numpy(all_labels).to(torch.int8),
+        "split": torch.from_numpy(all_splits).to(torch.int8),
+        "meta": {
+            "schema_version": schemas.SCHEMA_VERSION,
+            "ensemble_auc": float(ensemble_auc),
+            "test_aucs": [float(x) for x in test_aucs],
+            "best_cal_aucs": [float(x) for x in best_cal_aucs],
+            "arch": arch,
+            "use_edge_attr": use_edge_attr,
+            "hidden": hidden,
+            "dropout": dropout,
+            "lr": lr,
+            "weight_decay": weight_decay,
+            "n_ensemble": n_ensemble,
+            "pos_weight": float(pos_weight.item()),
+            "n_train": len(train_graphs),
+            "n_cal": len(cal_graphs),
+            "n_test": len(test_graphs),
+            "epochs": num_epochs,
+            "source": "ensemble_averaging",
+            "trained_on": "train_only",
+        },
+    }
+    
+    schemas.assert_valid("scores", schemas.validate_scores(scores_artifact))
+    return scores_artifact
+
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Train GNN on synolitic graphs")
+    parser.add_argument("--graphs", default="artifacts/graphs.pt")
+    parser.add_argument("--out", default="artifacts/scores.pt")
+    parser.add_argument("--epochs", type=int, default=150)
+    parser.add_argument("--batch", type=int, default=128)
+    parser.add_argument("--lr", type=float, default=0.001)
+    parser.add_argument("--hidden", type=int, default=128)
+    parser.add_argument("--dropout", type=float, default=0.3)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--arch", choices=['gat', 'gcn'], default='gcn')
+    parser.add_argument("--no-edge-attr", action='store_true', help="Disable edge_attr")
+    parser.add_argument("--patience", type=int, default=40)
+    parser.add_argument("--ensemble", type=int, default=5)
+    args = parser.parse_args()
+    
+
+    print(f"Arch: {args.arch}")
+    print(f"Use edge_attr: {not args.no_edge_attr}")
+    print(f"Ensemble: {args.ensemble}")
+    print(f"Hidden: {args.hidden}")
+    
+    graphs_artifact = load_artifact(args.graphs)
+    schemas.assert_valid("graphs", schemas.validate_graphs(graphs_artifact))
+    
+    scores = train_gnn(
+        graphs_artifact,
+        num_epochs=args.epochs,
+        batch_size=args.batch,
+        lr=args.lr,
+        hidden=args.hidden,
+        dropout=args.dropout,
+        weight_decay=args.weight_decay,
+        arch=args.arch,
+        use_edge_attr=not args.no_edge_attr,
+        patience=args.patience,
+        n_ensemble=args.ensemble,
+    )
+    
+    save_artifact(scores, args.out)
+    print(f"\n Saved scores to: {args.out}")
+    print(f"   Ensemble AUC: {scores['meta']['ensemble_auc']:.4f}")
+    print(f"   Trained on: {scores['meta']['trained_on']}")
