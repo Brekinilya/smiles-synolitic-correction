@@ -134,6 +134,14 @@ Baselines for the results table: softmax-confidence rejection, logistic
 regression / MLP on raw `X`, GNN on synolitic graphs, corrector on synolitic
 features vs corrector on raw features (hypothesis H1).
 
+## Results
+
+Final pre-defense numbers live in [docs/results.md](docs/results.md).
+Headlines: GNN on synolitic graphs reaches test AUC **0.839** vs 0.799 for
+the softmax-confidence baseline; as a corrector at Δ=0.8 it keeps 55.9% of
+answers at **91.1% precision** (base accuracy 72.4%) rejecting 82.1% of
+errors; **all Theorem-1 bounds hold empirically** on the untouched test split.
+
 ## References
 
 - Zaikin et al., _Overcoming the Curse of Dimensionality with Synolitic AI_, Technologies 14(2):84, 2026.
