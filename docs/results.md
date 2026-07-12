@@ -70,6 +70,34 @@ graph_summary_fisher @youden     -      -     0.809      -     0.362     0.769  
    the blessing-of-dimensionality effects the method targets are expected to
    grow at d=379 (fMRI) and d=4096 (Llama 2).
 
+## H2 stress test: guarantees vs labeling budget
+
+H2 claims meaningful bounds with fewer than 100 labeled correction examples.
+We subsample the calibration split to M labeled examples, refit Algorithm 1
+(Δ = 0.8, GNN score) and read bounds vs empirical test rates (30 random
+subsamples per M; the test split is never used for calibration):
+
+```
+    M    M- | rej bound  rej emp | acc bound  acc emp | prec@acc
+   30     7 |     0.330    0.784 |     0.295    0.669 |    0.902
+   50    13 |     0.416    0.772 |     0.456    0.726 |    0.898
+  100    27 |     0.511    0.806 |     0.502    0.694 |    0.907
+  200    55 |     0.586    0.803 |     0.550    0.707 |    0.906
+  500   134 |     0.656    0.818 |     0.596    0.699 |    0.910
+ 1000   268 |     0.694    0.815 |     0.635    0.710 |    0.910
+ 2000   535 |     0.722    0.821 |     0.650    0.704 |    0.911
+```
+
+Empirical corrector quality is nearly flat in M (rejection ~0.78–0.82 and
+precision ~0.90 already at M = 30): **labeling buys the strength of the
+guarantee, not raw performance** — the certified lower bound grows
+0.33 → 0.51 → 0.72. Bounds are already meaningful at M = 100, which is the
+literal statement of H2. Every row respects its bound. Reproduce with:
+
+```bash
+uv run python scripts/h2_labeling_curve.py
+```
+
 ## Ablation history worth keeping (stage 3)
 
 Five permutation-invariant GNN variants (GCN/GATv2 ×2–3 layers, ±BatchNorm,
