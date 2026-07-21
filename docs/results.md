@@ -99,6 +99,32 @@ graph_summary_fisher @youden     -      -     0.809      -     0.362     0.769  
    the blessing-of-dimensionality effects the method targets are expected to
    grow at d=379 (fMRI) and d=4096 (Llama 2).
 
+### H1 under length control
+
+The +0.040 global gap is partly a **length confound**. Sequence length is almost
+perfectly recoverable from the pooled hidden state (ridge R² = 0.9995), and
+exact-match accuracy varies non-monotonically with length, collapsing at L=20
+(0.377 vs ~0.75 elsewhere; 19.5% of all errors). Confidence declines smoothly
+with length (Pearson r = −0.73, all N) while accuracy does not, so its length
+dependence is miscalibrated across strata and costs it globally; the GNN score
+(r = −0.30) responds specifically to the L=20 collapse, which is genuinely
+predictive. Stratifying by length removes both effects.
+
+| comparison        | GNN   | confidence | GNN − conf |
+|-------------------|-------|------------|------------|
+| global AUC        | 0.839 | 0.799      | +0.040     |
+| within-length AUC | 0.806 | 0.817      | −0.010     |
+
+Sample-weighted over L=10..20, test split. Bootstrap (2000 resamples of the test
+split): GNN − conf = −0.010, 95% CI [−0.018, −0.003]; the reversal is not noise.
+
+At d=64 our current pipeline does not beat confidence once length is controlled.
+Note this is a statement about the current implementation: the pairwise
+classifiers are fitted without feature standardization under L2, which may bias
+edge selection toward high-variance coordinates. Reproduce with:
+
+    uv run python scripts/h1_length_control.py
+
 ## H2 stress test: guarantees vs labeling budget
 
 H2 claims meaningful bounds with fewer than 100 labeled correction examples.

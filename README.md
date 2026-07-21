@@ -67,8 +67,9 @@ that keeps the theoretical bounds honest:**
 | `cal`   | stage 4 fits the Fisher projector and calibrates thresholds Δ      |
 | `test`  | final reported numbers only — never fit/calibrate on it            |
 
-Model training data is generated on the fly with seeds disjoint from the
-extraction set, so it never overlaps any split.
+Model training data is generated on the fly from a random stream independent of
+the extraction stream. Overlap is not excluded by construction, but with
+10^10–10^20 possible sequences per length it is negligible in practice.
 
 ## Data contracts (v1.1)
 
@@ -149,6 +150,9 @@ Headlines: GNN on synolitic graphs reaches test AUC **0.839** vs 0.799 for
 the softmax-confidence baseline; as a corrector at Δ=0.8 it keeps 55.9% of
 answers at **91.1% precision** (base accuracy 72.4%) rejecting 82.1% of
 errors; **all Theorem-1 bounds hold empirically** on the untouched test split.
+This global AUC gap is partly a **length confound**: within fixed sequence
+length the ranking reverses (GNN 0.806 vs confidence 0.817) — see
+[docs/results.md](docs/results.md#h1-under-length-control).
 
 ## References
 
