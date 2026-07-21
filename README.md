@@ -36,8 +36,16 @@ uv sync                                        # env (torch, torch-geometric, sk
 uv run pytest -q                               # contract + model tests
 uv run python scripts/make_dummy_data.py       # artifacts/dummy/{hidden_states,graphs,scores}.pt
 uv run python scripts/run_corrector.py         # stage 4 demo: Theorem-1 bounds vs empirical rates
-# stage 1 (real data):
-uv run python scripts/train_model.py           # stops inside the 0.70–0.85 accuracy band
+# stage 1 (real data) — three passes; reproduces artifacts/hidden_states.pt bit-for-bit:
+#   1a  deliberate undertraining — default settings stall at ~0.046 exact-match
+#       (step 5000); this pass only seeds the warm start.
+uv run python scripts/train_model.py --out-dir artifacts/checkpoints_pretrain
+#   1b  warm start (higher LR + fine eval grid) catches the 0.70–0.85 band at
+#       pass-1b step 2900 (cumulative 7900), val exact-match 0.766 -> artifacts/checkpoints/
+uv run python scripts/train_model.py \
+    --init-from artifacts/checkpoints_pretrain/model_best.pt \
+    --lr 1e-3 --steps 4000 --eval-every 50
+#   1c  extract — N=10000, model accuracy 0.724, splits 6000/2000/2000
 uv run python scripts/extract_hidden_states.py # -> artifacts/hidden_states.pt
 # stage 4 on real artifacts:
 uv run python scripts/run_corrector.py \
