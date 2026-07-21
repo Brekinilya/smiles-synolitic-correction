@@ -14,19 +14,31 @@ from synolitic.common.schemas import BOS, EOS, FIRST_DIGIT, N_DIGITS, PAD
 
 
 def make_dataset(
-    n: int, min_len: int, max_len: int, generator: torch.Generator
+    n: int,
+    min_len: int,
+    max_len: int,
+    generator: torch.Generator,
+    pad_to: int | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Sample ``n`` sequences padded to ``max_len``.
+    """Sample ``n`` sequences with lengths in [min_len, max_len].
+
+    The padding width (window) is ``pad_to`` if given, else ``max_len``.
+    Decoupling the two lets us hold sequence lengths fixed while widening the
+    window so every sample keeps at least one PAD position (edge-artifact
+    check for L == max_len, where the window would otherwise be full).
 
     Returns:
-        src: [n, max_len] digit tokens, PAD beyond each length.
-        tgt_digits: [n, max_len] reversed digit tokens, PAD beyond each length.
+        src: [n, width] digit tokens, PAD beyond each length.
+        tgt_digits: [n, width] reversed digit tokens, PAD beyond each length.
         lengths: [n] int64.
     """
+    width = pad_to if pad_to is not None else max_len
+    if width < max_len:
+        raise ValueError(f"pad_to ({width}) must be >= max_len ({max_len})")
     lengths = torch.randint(min_len, max_len + 1, (n,), generator=generator)
-    pos = torch.arange(max_len).unsqueeze(0).expand(n, max_len)
+    pos = torch.arange(width).unsqueeze(0).expand(n, width)
     in_len = pos < lengths.unsqueeze(1)
-    src = torch.randint(0, N_DIGITS, (n, max_len), generator=generator) + FIRST_DIGIT
+    src = torch.randint(0, N_DIGITS, (n, width), generator=generator) + FIRST_DIGIT
     src = torch.where(in_len, src, torch.full_like(src, PAD))
     rev_idx = (lengths.unsqueeze(1) - 1 - pos).clamp(min=0)
     tgt = torch.gather(src, 1, rev_idx)
