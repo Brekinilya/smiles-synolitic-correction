@@ -153,6 +153,56 @@ literal statement of H2. Every row respects its bound. Reproduce with:
 uv run python scripts/h2_labeling_curve.py
 ```
 
+## H3: mechanistic error decomposition (replaces the original H3)
+
+The original H3 — that synolitic graph topology correlates with attention-head
+specialization — is **not supported**. The two quantities live in different
+spaces (8 attention heads over token positions vs the 64 hidden dimensions the
+graph is built from; a graph is a function of the input, not of a head), and the
+strong Spearman correlations reported for it in the original analysis (|r| up to
+0.935) are a **length confound**: attention entropy is bounded by log L and
+rises with length, while node centrality, derived from X, falls with length, so
+any pair of them correlates mechanically; the association does not survive
+stratification by length. In its place, a mechanistic analysis of the
+cross-attention decomposes the model's errors into three independently measured
+sources. Reproduce all of the below with:
+
+    uv run python scripts/h3_mirror_map.py
+
+**1. A redundant reversal circuit.** All four layer-2 cross-attention heads
+implement the reversal, attending to the mirror position (decode step _t_ →
+source position _L−1−t_): mirror hit-rate 0.79–0.86 vs a chance of 0.07, while
+layer-1 heads and the identity (diagonal) pattern sit at chance. The reversal is
+carried redundantly across the layer, not by a single specialized head.
+
+**2. Mirror fidelity predicts correctness — within length, not as a confound.**
+Within every fixed length, correct predictions have higher mirror fidelity than
+errors: sample-weighted gap **+0.091, 95 % CI [+0.079, +0.104]** (stratified
+bootstrap over the 11 length strata, 2000 resamples; 0/2000 ≤ 0). Not a
+tautology: **~25 % of errors (140 / 554) occur with the copy intact** (mirror >
+0.9), so errors have sources the copy circuit does not capture.
+
+**3. Termination / EOS-timing is a dominant error source.** Roughly 50–90 % of
+errors are the model emitting EOS at the wrong position (wrong output length),
+not wrong content — the large majority at short lengths (~85–90 %). This is a
+decoder mechanism distinct from the copy, and it accounts for the "copy intact
+but wrong" errors above.
+
+**4. Copy degradation at maximum length explains the L=20 collapse.** The mirror
+hit-rate degrades only smoothly with length (L=20 residual −0.06 vs the L=10–19
+trend), yet accuracy collapses sharply (L=20 residual −0.40) — the failure at
+the boundary is in copy _precision_, not attention _position_. Per-token content
+accuracy (correctly-terminated) falls from ~0.99 at short lengths to 0.941 at
+L=20. Constant-rate compounding is ruled out — using the short-length ~0.987
+per-token accuracy it predicts exact-match 0.77 vs the observed 0.38 — but the
+measured per-token drop plus **error correlation** (token errors cluster in a
+subset of hard examples; observed / independent rises 1.03 → 1.90 with length)
+reproduces the collapse exactly: at L=20, 33 % termination failures + 67 %
+correctly-terminated × 55.9 % fully correct = 0.377 = observed exact-match.
+
+The bootstrap CI in (2) applies only to the reversal-circuit predictor; (3) and
+(4) stand on exact decompositions, not mean estimates.
+
 ## Ablation history worth keeping (stage 3)
 
 Five permutation-invariant GNN variants (GCN/GATv2 ×2–3 layers, ±BatchNorm,
