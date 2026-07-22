@@ -79,12 +79,15 @@ graph_summary_fisher @youden     -      -     0.809      -     0.362     0.769  
 
 ## Headlines
 
-1. **The synolitic pipeline beats the strong softmax baseline.** GNN on
+1. **The synolitic corrector keeps more answers at higher precision than the
+   softmax baseline — but the raw-AUC gap is a length confound.** GNN on
    synolitic graphs (with model confidence as a node feature) reaches test
-   AUC **0.839** vs **0.799** for confidence alone. As a corrector at
-   Δ=0.8 it keeps **55.9%** of the model's answers at **91.1% precision**
-   (base accuracy 72.4%) while rejecting **82.1%** of errors — strictly
-   better than the confidence corrector at every operating point.
+   AUC **0.839** vs **0.799** for confidence alone; this global gap **does not
+   survive length control** — within-length it reverses (see "H1 under length
+   control" below). As a corrector at Δ=0.8 it keeps **55.9%** of answers at
+   **91.1% precision** (base accuracy 72.4%) vs 45.3% at 89.4% for the
+   confidence corrector, rejecting **82.1%** of errors. At d=64 this
+   operational gain partly rides the L=20 error cluster.
 2. **Theorem-1 guarantees hold empirically.** All 20 bound comparisons
    (5 feature sets × 2 Δ × accept/reject) are satisfied on the untouched
    test split; thresholds and bounds were computed on the calibration split
